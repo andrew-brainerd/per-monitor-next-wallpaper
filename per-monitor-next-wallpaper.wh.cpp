@@ -2,7 +2,7 @@
 // @id              per-monitor-next-wallpaper
 // @name            Per-Monitor Next Desktop Background
 // @description     Makes "Next desktop background" change the monitor you right-clicked, and adds an option to sync all monitors
-// @version         1.0.1
+// @version         1.0.0
 // @author          Sp1d3rM0nk3y
 // @github          https://github.com/andrew-brainerd
 // @include         explorer.exe
@@ -20,6 +20,8 @@ right-clicked. This mod makes it change the monitor you right-clicked.
 It also adds a **Sync desktop backgrounds** item, which copies the
 right-clicked monitor's image to every other monitor. You can also set
 **Next desktop background** to change all monitors to the same new image.
+
+![Desktop context menu](https://raw.githubusercontent.com/andrew-brainerd/per-monitor-next-wallpaper/main/images/context-menu.png)
 
 ## How it works
 
@@ -302,7 +304,9 @@ void ApplyWallpapers(
 
     for (const auto& [id, path] : changes) {
         HRESULT hr = dw->SetWallpaper(id.c_str(), path.c_str());
-        Wh_Log(L"SetWallpaper %s -> %s: 0x%08X", id.c_str(), path.c_str(), hr);
+        if (FAILED(hr)) {
+            Wh_Log(L"SetWallpaper(%s) failed: 0x%08X", path.c_str(), hr);
+        }
     }
 
     bool settled = WaitFor(
@@ -323,7 +327,9 @@ void ApplyWallpapers(
     }
 
     HRESULT hr = dw->SetSlideshow(slideshow);
-    Wh_Log(L"SetSlideshow: 0x%08X", hr);
+    if (FAILED(hr)) {
+        Wh_Log(L"SetSlideshow failed: 0x%08X", hr);
+    }
 
     if (haveOptions) {
         DESKTOP_SLIDESHOW_OPTIONS newOptions{};
@@ -472,7 +478,6 @@ std::optional<Action> ClassifyCommand(CMINVOKECOMMANDINFO* info) {
         }
     }
 
-    Wh_Log(L"InvokeCommand verb: %s", verb.c_str());
     if (_wcsicmp(verb.c_str(), kNextVerb) == 0) {
         return next;
     }
@@ -511,10 +516,6 @@ HRESULT STDMETHODCALLTYPE QueryContextMenu_Hook(IContextMenu* self,
     int countBefore = GetMenuItemCount(menu);
     HRESULT hr = QueryContextMenu_Original(self, menu, indexMenu, idCmdFirst,
                                            idCmdLast, flags);
-    Wh_Log(L"QueryContextMenu flags=0x%X ids=%u-%u index=%u hr=0x%08X "
-           L"added=%d",
-           flags, idCmdFirst, idCmdLast, indexMenu, hr,
-           GetMenuItemCount(menu) - countBefore);
     if (FAILED(hr) || !g_settings.syncMenuItem ||
         (flags & CMF_DEFAULTONLY)) {
         return hr;
@@ -551,7 +552,6 @@ HRESULT STDMETHODCALLTYPE GetCommandString_Hook(IContextMenu* self,
                                                 UINT* reserved,
                                                 CHAR* name,
                                                 UINT cchMax) {
-    Wh_Log(L"GetCommandString id=%u type=0x%X", (UINT)idCmd, type);
     if (idCmd != g_syncOffset) {
         return GetCommandString_Original(self, idCmd, type, reserved, name,
                                          cchMax);
@@ -583,7 +583,6 @@ HRESULT STDMETHODCALLTYPE InvokeCommand_Hook(IContextMenu* self,
     }
 
     POINT pt = GetInvokePoint(info);
-    Wh_Log(L"Action %d at (%ld, %ld)", (int)*action, pt.x, pt.y);
     if (!StartWorker(*action, pt)) {
         return *action == Action::Sync ? E_FAIL
                                        : InvokeCommand_Original(self, info);
