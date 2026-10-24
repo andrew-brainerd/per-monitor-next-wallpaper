@@ -6,6 +6,7 @@
 // @author          Sp1d3rM0nk3y
 // @github          https://github.com/andrew-brainerd
 // @include         explorer.exe
+// @architecture    x86-64
 // @compilerOptions -lole32 -luuid -lshell32 -lshlwapi
 // ==/WindhawkMod==
 
@@ -25,19 +26,30 @@ right-clicked monitor's image to every other monitor. You can also set
 
 ## How it works
 
-Windows can't advance the slideshow on one chosen monitor:
-`IDesktopWallpaper::AdvanceSlideshow` returns `E_NOTIMPL` for anything but
-"the next monitor in turn". So the mod picks the image itself from the
-slideshow folder (including subfolders), shuffling if the slideshow is set to
-shuffle. It sets that image on the monitor, then turns the slideshow back on
-with the same folder and settings.
+**Next desktop background** still runs Windows' own slideshow advance. Windows
+picks the monitor that gets the next image in turn
+(`CMultimonWallpaperState::_GetNextMonitor` in `shell32.dll`), and the mod
+makes that pick return the monitor you right-clicked. Windows' shuffle order,
+image history and saved settings work as usual.
+
+Windows can't show the same slideshow image on several monitors, so **Sync
+desktop backgrounds** and the all-monitors option set the image with
+`IDesktopWallpaper::SetWallpaper`. That turns the slideshow off, so the mod
+then turns it back on with the same folder and settings.
+
+## Saved changes
+
+Sync and the all-monitors option change your saved wallpaper, the same as
+picking an image in Settings. If one of these changes is interrupted, for
+example by Explorer restarting, the slideshow can be left off. The mod turns
+it back on the next time it loads.
 
 ## Limitations
 
 - The slideshow timer still changes one monitor at a time, so synced monitors
   go out of sync at the next timed change.
-- The mod uses its own shuffle, separate from Windows'. An image Windows
-  showed recently can come up again.
+- The all-monitors option picks images itself, from the slideshow folder and
+  its subfolders, separately from Windows' shuffle order.
 */
 // ==/WindhawkModReadme==
 
@@ -56,9 +68,12 @@ with the same folder and settings.
 
 #include <windows.h>
 #include <windowsx.h>
+#include <shlobj.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <strsafe.h>
+
+#include <windhawk_utils.h>
 
 #include <algorithm>
 #include <atomic>
@@ -70,12 +85,11 @@ with the same folder and settings.
 #include <utility>
 #include <vector>
 
-enum class Action { Next, NextAll, Sync };
+enum class Command { Next, Sync };
+enum class Action { NextAll, Sync };
 
-struct {
-    bool nextAll;
-    bool syncMenuItem;
-} g_settings;
+std::atomic<bool> g_nextAll;
+std::atomic<bool> g_syncMenuItem;
 
 const CLSID kClsidSlideshowContextMenu = {
     0x0bf754aa,
@@ -87,10 +101,27 @@ const wchar_t kSyncHelpText[] =
     L"Copies this monitor's background to every other monitor";
 const wchar_t kNextVerb[] = L"NextDesktopBackground";
 const wchar_t kSyncVerb[] = L"SyncDesktopBackgrounds";
+constexpr DWORD kPendingMonitorTimeoutMs = 15000;
 
 std::atomic<UINT> g_syncOffset{UINT_MAX};
+std::atomic<UINT> g_handlerOffsetEnd{0};
 std::atomic<DWORD> g_menuMessagePos{0};
-std::mutex g_workMutex;
+void* g_slideshowMenuVtable;
+HMODULE g_handlerModule;
+
+std::atomic<HMONITOR> g_pendingMonitor{nullptr};
+std::atomic<DWORD> g_pendingMonitorTick{0};
+
+struct WorkItem {
+    Action action;
+    POINT pt;
+};
+
+HANDLE g_workerThread;
+HANDLE g_stopEvent;
+HANDLE g_workEvent;
+std::mutex g_pendingWorkMutex;
+std::optional<WorkItem> g_pendingWork;
 
 struct Monitor {
     std::wstring id;
@@ -184,7 +215,11 @@ void CollectImages(const std::wstring& dir,
         }
         std::wstring path = dir + L"\\" + data.cFileName;
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (wcscmp(data.cFileName, L".") != 0 &&
+            // Skip junctions and symlinks, but not cloud (OneDrive) folders.
+            bool isLink =
+                (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                IsReparseTagNameSurrogate(data.dwReserved0);
+            if (!isLink && wcscmp(data.cFileName, L".") != 0 &&
                 wcscmp(data.cFileName, L"..") != 0) {
                 CollectImages(path, out, depth + 1);
             }
@@ -195,11 +230,11 @@ void CollectImages(const std::wstring& dir,
     FindClose(find);
 }
 
-std::vector<std::wstring> GetSlideshowImages(IShellItemArray* slideshow) {
-    std::vector<std::wstring> images;
+std::vector<std::wstring> GetSlideshowPaths(IShellItemArray* slideshow) {
+    std::vector<std::wstring> paths;
     DWORD count = 0;
     if (FAILED(slideshow->GetCount(&count))) {
-        return images;
+        return paths;
     }
     for (DWORD i = 0; i < count; i++) {
         IShellItem* item = nullptr;
@@ -208,16 +243,24 @@ std::vector<std::wstring> GetSlideshowImages(IShellItemArray* slideshow) {
         }
         LPWSTR path = nullptr;
         if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-            DWORD attributes = GetFileAttributesW(path);
-            if (attributes != INVALID_FILE_ATTRIBUTES &&
-                (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                CollectImages(path, images);
-            } else if (IsImageFile(path)) {
-                images.push_back(path);
-            }
+            paths.push_back(path);
             CoTaskMemFree(path);
         }
         item->Release();
+    }
+    return paths;
+}
+
+std::vector<std::wstring> GetSlideshowImages(IShellItemArray* slideshow) {
+    std::vector<std::wstring> images;
+    for (const std::wstring& path : GetSlideshowPaths(slideshow)) {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            CollectImages(path, images);
+        } else if (IsImageFile(path.c_str())) {
+            images.push_back(path);
+        }
     }
     std::sort(images.begin(), images.end(),
               [](const std::wstring& a, const std::wstring& b) {
@@ -276,13 +319,14 @@ std::wstring PickNextImage(const std::vector<std::wstring>& images,
     return images[candidates.front()];
 }
 
+// Returns false on timeout or when the mod is unloading.
 bool WaitFor(const std::function<bool()>& condition, DWORD timeoutMs) {
     DWORD start = GetTickCount();
     while (!condition()) {
-        if (GetTickCount() - start >= timeoutMs) {
+        if (GetTickCount() - start >= timeoutMs ||
+            WaitForSingleObject(g_stopEvent, 100) == WAIT_OBJECT_0) {
             return false;
         }
-        Sleep(100);
     }
     return true;
 }
@@ -290,6 +334,89 @@ bool WaitFor(const std::function<bool()>& condition, DWORD timeoutMs) {
 bool IsSlideshowActive(IDesktopWallpaper* dw) {
     DESKTOP_SLIDESHOW_STATE state{};
     return SUCCEEDED(dw->GetStatus(&state)) && (state & DSS_SLIDESHOW);
+}
+
+void SaveRearmState(const std::vector<std::wstring>& paths) {
+    std::wstring joined;
+    for (const std::wstring& path : paths) {
+        joined += path;
+        joined += L'\n';
+    }
+    Wh_SetStringValue(L"rearmPaths", joined.c_str());
+    Wh_SetIntValue(L"rearmPending", 1);
+}
+
+void ClearRearmState() {
+    Wh_DeleteValue(L"rearmPending");
+    Wh_DeleteValue(L"rearmPaths");
+}
+
+HRESULT CreateItemArray(const std::vector<std::wstring>& paths,
+                        IShellItemArray** result) {
+    std::vector<PIDLIST_ABSOLUTE> pidls;
+    for (const std::wstring& path : paths) {
+        PIDLIST_ABSOLUTE pidl = nullptr;
+        if (SUCCEEDED(
+                SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr))) {
+            pidls.push_back(pidl);
+        }
+    }
+    HRESULT hr = pidls.empty()
+                     ? E_FAIL
+                     : SHCreateShellItemArrayFromIDLists(
+                           (UINT)pidls.size(),
+                           (PCIDLIST_ABSOLUTE_ARRAY)pidls.data(), result);
+    for (PIDLIST_ABSOLUTE pidl : pidls) {
+        CoTaskMemFree(pidl);
+    }
+    return hr;
+}
+
+// Turns the slideshow back on if an earlier sync was interrupted after it
+// turned the slideshow off.
+void RecoverInterruptedChange() {
+    if (!Wh_GetIntValue(L"rearmPending", 0)) {
+        return;
+    }
+
+    std::vector<WCHAR> buffer(32768);
+    Wh_GetStringValue(L"rearmPaths", buffer.data(), buffer.size());
+    std::vector<std::wstring> paths;
+    std::wstring current;
+    for (const WCHAR* p = buffer.data(); *p; p++) {
+        if (*p == L'\n') {
+            paths.push_back(std::move(current));
+            current.clear();
+        } else {
+            current += *p;
+        }
+    }
+
+    // Explorer may still be starting, so retry for a while.
+    IDesktopWallpaper* dw = nullptr;
+    WaitFor(
+        [&] {
+            return SUCCEEDED(CoCreateInstance(CLSID_DesktopWallpaper, nullptr,
+                                              CLSCTX_ALL, IID_PPV_ARGS(&dw)));
+        },
+        30000);
+    if (!dw) {
+        return;
+    }
+
+    if (!IsSlideshowActive(dw)) {
+        IShellItemArray* slideshow = nullptr;
+        HRESULT hr = CreateItemArray(paths, &slideshow);
+        if (SUCCEEDED(hr)) {
+            hr = dw->SetSlideshow(slideshow);
+            slideshow->Release();
+        }
+        Wh_Log(L"Re-enabled the slideshow after an interrupted change: "
+               L"0x%08X",
+               hr);
+    }
+    ClearRearmState();
+    dw->Release();
 }
 
 // Setting a wallpaper turns the slideshow off, so it is re-armed afterwards
@@ -302,6 +429,8 @@ void ApplyWallpapers(
     UINT tick = 0;
     bool haveOptions = SUCCEEDED(dw->GetSlideshowOptions(&options, &tick));
 
+    SaveRearmState(GetSlideshowPaths(slideshow));
+
     for (const auto& [id, path] : changes) {
         HRESULT hr = dw->SetWallpaper(id.c_str(), path.c_str());
         if (FAILED(hr)) {
@@ -309,7 +438,7 @@ void ApplyWallpapers(
         }
     }
 
-    bool settled = WaitFor(
+    WaitFor(
         [&] {
             if (IsSlideshowActive(dw)) {
                 return false;
@@ -322,9 +451,6 @@ void ApplyWallpapers(
                                });
         },
         5000);
-    if (!settled) {
-        Wh_Log(L"Timed out waiting for the wallpaper change to settle");
-    }
 
     HRESULT hr = dw->SetSlideshow(slideshow);
     if (FAILED(hr)) {
@@ -340,14 +466,14 @@ void ApplyWallpapers(
         }
     }
 
-    if (!WaitFor([&] { return IsSlideshowActive(dw); }, 5000)) {
+    if (WaitFor([&] { return IsSlideshowActive(dw); }, 5000)) {
+        ClearRearmState();
+    } else {
         Wh_Log(L"Slideshow did not turn back on");
     }
 }
 
-void RunAction(Action action, POINT pt) {
-    std::lock_guard lock(g_workMutex);
-
+void RunAction(const WorkItem& item) {
     IDesktopWallpaper* dw = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_DesktopWallpaper, nullptr, CLSCTX_ALL,
                                   IID_PPV_ARGS(&dw));
@@ -358,16 +484,15 @@ void RunAction(Action action, POINT pt) {
 
     IShellItemArray* slideshow = nullptr;
     std::vector<Monitor> monitors = GetMonitors(dw);
-    int target = FindMonitorAt(monitors, pt);
+    int target = FindMonitorAt(monitors, item.pt);
     std::vector<std::pair<std::wstring, std::wstring>> changes;
 
     if (!IsSlideshowActive(dw) || FAILED(dw->GetSlideshow(&slideshow)) ||
         target < 0) {
-        Wh_Log(L"No active slideshow or monitor, using the default action");
-        if (action != Action::Sync) {
+        if (item.action == Action::NextAll) {
             dw->AdvanceSlideshow(nullptr, DSD_FORWARD);
         }
-    } else if (action == Action::Sync) {
+    } else if (item.action == Action::Sync) {
         const std::wstring& source = monitors[target].wallpaper;
         for (const Monitor& monitor : monitors) {
             if (!source.empty() && !SamePath(monitor.wallpaper, source)) {
@@ -389,14 +514,11 @@ void RunAction(Action action, POINT pt) {
             PickNextImage(GetSlideshowImages(slideshow),
                           monitors[target].wallpaper, showing, shuffle);
         if (next.empty()) {
-            Wh_Log(L"No other image found, using the default action");
             dw->AdvanceSlideshow(nullptr, DSD_FORWARD);
-        } else if (action == Action::NextAll) {
+        } else {
             for (const Monitor& monitor : monitors) {
                 changes.emplace_back(monitor.id, next);
             }
-        } else {
-            changes.emplace_back(monitors[target].id, next);
         }
     }
 
@@ -410,53 +532,100 @@ void RunAction(Action action, POINT pt) {
     dw->Release();
 }
 
-struct WorkItem {
-    Action action;
-    POINT pt;
-    HMODULE module;
-};
+DWORD WINAPI WorkerThread(void*) {
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hrInit)) {
+        RecoverInterruptedChange();
+    }
 
-DWORD WINAPI WorkerThread(void* param) {
-    WorkItem item = *(WorkItem*)param;
-    delete (WorkItem*)param;
+    HANDLE handles[] = {g_stopEvent, g_workEvent};
+    while (WaitForMultipleObjects(ARRAYSIZE(handles), handles, FALSE,
+                                  INFINITE) == WAIT_OBJECT_0 + 1) {
+        std::optional<WorkItem> item;
+        {
+            std::lock_guard lock(g_pendingWorkMutex);
+            item = std::exchange(g_pendingWork, std::nullopt);
+        }
+        if (item && SUCCEEDED(hrInit)) {
+            RunAction(*item);
+        }
+    }
 
-    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-        RunAction(item.action, item.pt);
+    if (SUCCEEDED(hrInit)) {
         CoUninitialize();
     }
-
-    FreeLibraryAndExitThread(item.module, 0);
+    return 0;
 }
 
-// The worker holds a reference to the mod DLL so it can't be unloaded while
-// a wallpaper change is in progress.
-bool StartWorker(Action action, POINT pt) {
-    HMODULE module = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                            (PCWSTR)&WorkerThread, &module)) {
-        return false;
+void QueueWork(Action action, POINT pt) {
+    {
+        std::lock_guard lock(g_pendingWorkMutex);
+        g_pendingWork = WorkItem{action, pt};
     }
-    auto* item = new WorkItem{action, pt, module};
-    HANDLE thread = CreateThread(nullptr, 0, WorkerThread, item, 0, nullptr);
-    if (!thread) {
-        delete item;
-        FreeLibrary(module);
-        return false;
-    }
-    CloseHandle(thread);
-    return true;
+    SetEvent(g_workEvent);
 }
 
-std::optional<Action> ClassifyCommand(CMINVOKECOMMANDINFO* info) {
-    Action next = g_settings.nextAll ? Action::NextAll : Action::Next;
+void SetPendingMonitor(HMONITOR monitor) {
+    g_pendingMonitorTick = GetTickCount();
+    g_pendingMonitor = monitor;
+}
 
+HMONITOR TakePendingMonitor() {
+    HMONITOR monitor = g_pendingMonitor.exchange(nullptr);
+    if (monitor &&
+        GetTickCount() - g_pendingMonitorTick > kPendingMonitorTimeoutMs) {
+        return nullptr;
+    }
+    return monitor;
+}
+
+using GetMonitorCount_t = int(WINAPI*)(const void* self);
+GetMonitorCount_t GetMonitorCount;
+
+using GetMonitorAt_t = HMONITOR(WINAPI*)(void* self, int index);
+GetMonitorAt_t GetMonitorAt;
+
+using GetNextMonitor_t = int(WINAPI*)(void* self,
+                                      int lastIndex,
+                                      int orientation,
+                                      int mode,
+                                      PCWSTR imagePath,
+                                      bool flag);
+GetNextMonitor_t GetNextMonitor_Original;
+
+// Picks the monitor that gets the next slideshow image.
+int WINAPI GetNextMonitor_Hook(void* self,
+                               int lastIndex,
+                               int orientation,
+                               int mode,
+                               PCWSTR imagePath,
+                               bool flag) {
+    if (HMONITOR target = TakePendingMonitor()) {
+        int count = GetMonitorCount(self);
+        for (int i = 0; i < count; i++) {
+            if (GetMonitorAt(self, i) == target) {
+                return i;
+            }
+        }
+    }
+    return GetNextMonitor_Original(self, lastIndex, orientation, mode,
+                                   imagePath, flag);
+}
+
+bool IsSlideshowMenu(IContextMenu* self) {
+    return self && *(void**)self == g_slideshowMenuVtable;
+}
+
+std::optional<Command> ClassifyCommand(CMINVOKECOMMANDINFO* info) {
     if (IS_INTRESOURCE(info->lpVerb)) {
         UINT offset = LOWORD((UINT_PTR)info->lpVerb);
-        UINT syncOffset = g_syncOffset;
-        if (offset == syncOffset) {
-            return Action::Sync;
+        if (offset == g_syncOffset) {
+            return Command::Sync;
         }
-        return offset < syncOffset ? std::optional(next) : std::nullopt;
+        if (offset < g_handlerOffsetEnd) {
+            return Command::Next;
+        }
+        return std::nullopt;
     }
 
     std::wstring verb;
@@ -479,10 +648,10 @@ std::optional<Action> ClassifyCommand(CMINVOKECOMMANDINFO* info) {
     }
 
     if (_wcsicmp(verb.c_str(), kNextVerb) == 0) {
-        return next;
+        return Command::Next;
     }
     if (_wcsicmp(verb.c_str(), kSyncVerb) == 0) {
-        return Action::Sync;
+        return Command::Sync;
     }
     return std::nullopt;
 }
@@ -510,18 +679,27 @@ HRESULT STDMETHODCALLTYPE QueryContextMenu_Hook(IContextMenu* self,
                                                 UINT idCmdFirst,
                                                 UINT idCmdLast,
                                                 UINT flags) {
+    if (!IsSlideshowMenu(self)) {
+        return QueryContextMenu_Original(self, menu, indexMenu, idCmdFirst,
+                                         idCmdLast, flags);
+    }
+
     g_menuMessagePos = GetMessagePos();
     g_syncOffset = UINT_MAX;
 
     int countBefore = GetMenuItemCount(menu);
     HRESULT hr = QueryContextMenu_Original(self, menu, indexMenu, idCmdFirst,
                                            idCmdLast, flags);
-    if (FAILED(hr) || !g_settings.syncMenuItem ||
-        (flags & CMF_DEFAULTONLY)) {
+    if (FAILED(hr)) {
         return hr;
     }
 
     UINT nextOffset = HRESULT_CODE(hr);
+    g_handlerOffsetEnd = nextOffset;
+    if (!g_syncMenuItem || (flags & CMF_DEFAULTONLY)) {
+        return hr;
+    }
+
     int inserted = GetMenuItemCount(menu) - countBefore;
     if (nextOffset == 0 || inserted <= 0 ||
         idCmdFirst + nextOffset > idCmdLast) {
@@ -552,7 +730,7 @@ HRESULT STDMETHODCALLTYPE GetCommandString_Hook(IContextMenu* self,
                                                 UINT* reserved,
                                                 CHAR* name,
                                                 UINT cchMax) {
-    if (idCmd != g_syncOffset) {
+    if (!IsSlideshowMenu(self) || idCmd != g_syncOffset) {
         return GetCommandString_Original(self, idCmd, type, reserved, name,
                                          cchMax);
     }
@@ -577,23 +755,29 @@ InvokeCommand_t InvokeCommand_Original;
 
 HRESULT STDMETHODCALLTYPE InvokeCommand_Hook(IContextMenu* self,
                                              CMINVOKECOMMANDINFO* info) {
-    std::optional<Action> action = info ? ClassifyCommand(info) : std::nullopt;
-    if (!action) {
+    std::optional<Command> command;
+    if (IsSlideshowMenu(self) && info) {
+        command = ClassifyCommand(info);
+    }
+    if (!command) {
         return InvokeCommand_Original(self, info);
     }
 
     POINT pt = GetInvokePoint(info);
-    if (!StartWorker(*action, pt)) {
-        return *action == Action::Sync ? E_FAIL
-                                       : InvokeCommand_Original(self, info);
+    if (*command == Command::Next && !g_nextAll) {
+        SetPendingMonitor(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST));
+        return InvokeCommand_Original(self, info);
     }
+
+    QueueWork(*command == Command::Sync ? Action::Sync : Action::NextAll, pt);
     return S_OK;
 }
 
 struct ContextMenuMethods {
-    void* queryContextMenu;
-    void* invokeCommand;
-    void* getCommandString;
+    void* vtable;
+    QueryContextMenu_t queryContextMenu;
+    InvokeCommand_t invokeCommand;
+    GetCommandString_t getCommandString;
 };
 
 // Runs on its own thread so COM can be initialized as needed.
@@ -607,14 +791,13 @@ DWORD WINAPI FindContextMenuMethods(void* param) {
                          CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&menu));
     if (SUCCEEDED(hr)) {
         void** vtable = *(void***)menu;
-        HMODULE module = nullptr;
-        // Keep stobject.dll loaded for as long as the hooks exist.
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_PIN,
-                               (PCWSTR)vtable[4], &module)) {
-            methods->queryContextMenu = vtable[3];
-            methods->invokeCommand = vtable[4];
-            methods->getCommandString = vtable[5];
+        // Keep the handler's DLL loaded while the hooks exist.
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                               (PCWSTR)vtable[4], &g_handlerModule)) {
+            methods->vtable = vtable;
+            methods->queryContextMenu = (QueryContextMenu_t)vtable[3];
+            methods->invokeCommand = (InvokeCommand_t)vtable[4];
+            methods->getCommandString = (GetCommandString_t)vtable[5];
         }
         menu->Release();
     } else {
@@ -627,15 +810,65 @@ DWORD WINAPI FindContextMenuMethods(void* param) {
     return 0;
 }
 
+bool HookShell32() {
+    HMODULE shell32 = GetModuleHandleW(L"shell32.dll");
+    if (!shell32) {
+        return false;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK shell32DllHooks[] = {
+        {
+            {LR"(public: int __cdecl CMultimonWallpaperState::_GetNextMonitor(int,enum IMAGE_ORIENTATION,enum CMultimonWallpaperState::GET_NEXT_MONITOR_MODE,unsigned short const *,bool))"},
+            &GetNextMonitor_Original,
+            GetNextMonitor_Hook,
+        },
+        {
+            {LR"(public: int __cdecl CMultimonWallpaperState::GetCount(void)const )"},
+            &GetMonitorCount,
+        },
+        {
+            {LR"(public: struct HMONITOR__ * __cdecl CMultimonWallpaperState::GetMonitorAt(int))"},
+            &GetMonitorAt,
+        },
+    };
+    return WindhawkUtils::HookSymbols(shell32, shell32DllHooks,
+                                     ARRAYSIZE(shell32DllHooks));
+}
+
 void LoadSettings() {
-    PCWSTR nextMode = Wh_GetStringSetting(L"nextMode");
-    g_settings.nextAll = wcscmp(nextMode, L"all") == 0;
-    Wh_FreeStringSetting(nextMode);
-    g_settings.syncMenuItem = Wh_GetIntSetting(L"syncMenuItem");
+    g_nextAll =
+        wcscmp(WindhawkUtils::StringSetting::make(L"nextMode"), L"all") == 0;
+    g_syncMenuItem = Wh_GetIntSetting(L"syncMenuItem");
+}
+
+void Cleanup() {
+    if (g_workerThread) {
+        SetEvent(g_stopEvent);
+        WaitForSingleObject(g_workerThread, INFINITE);
+        CloseHandle(g_workerThread);
+        g_workerThread = nullptr;
+    }
+    if (g_workEvent) {
+        CloseHandle(g_workEvent);
+        g_workEvent = nullptr;
+    }
+    if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+    }
+    if (g_handlerModule) {
+        FreeLibrary(g_handlerModule);
+        g_handlerModule = nullptr;
+    }
 }
 
 BOOL Wh_ModInit() {
     LoadSettings();
+
+    if (!HookShell32()) {
+        Wh_Log(L"Failed to hook shell32.dll");
+        return FALSE;
+    }
 
     ContextMenuMethods methods{};
     HANDLE thread =
@@ -646,19 +879,38 @@ BOOL Wh_ModInit() {
     WaitForSingleObject(thread, INFINITE);
     CloseHandle(thread);
 
-    if (!methods.queryContextMenu || !methods.invokeCommand ||
-        !methods.getCommandString) {
+    if (!methods.vtable) {
         Wh_Log(L"Slideshow context menu handler not found");
+        Cleanup();
         return FALSE;
     }
+    g_slideshowMenuVtable = methods.vtable;
 
-    Wh_SetFunctionHook(methods.queryContextMenu, (void*)QueryContextMenu_Hook,
-                       (void**)&QueryContextMenu_Original);
-    Wh_SetFunctionHook(methods.invokeCommand, (void*)InvokeCommand_Hook,
-                       (void**)&InvokeCommand_Original);
-    Wh_SetFunctionHook(methods.getCommandString, (void*)GetCommandString_Hook,
-                       (void**)&GetCommandString_Original);
+    WindhawkUtils::SetFunctionHook(methods.queryContextMenu,
+                                   QueryContextMenu_Hook,
+                                   &QueryContextMenu_Original);
+    WindhawkUtils::SetFunctionHook(methods.invokeCommand, InvokeCommand_Hook,
+                                   &InvokeCommand_Original);
+    WindhawkUtils::SetFunctionHook(methods.getCommandString,
+                                   GetCommandString_Hook,
+                                   &GetCommandString_Original);
+
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_workEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_workerThread =
+        g_stopEvent && g_workEvent
+            ? CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr)
+            : nullptr;
+    if (!g_workerThread) {
+        Wh_Log(L"Failed to start the worker thread");
+        Cleanup();
+        return FALSE;
+    }
     return TRUE;
+}
+
+void Wh_ModUninit() {
+    Cleanup();
 }
 
 void Wh_ModSettingsChanged() {
