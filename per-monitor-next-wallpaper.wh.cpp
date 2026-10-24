@@ -2,7 +2,7 @@
 // @id              per-monitor-next-wallpaper
 // @name            Per-Monitor Next Desktop Background
 // @description     Makes "Next desktop background" change the monitor you right-clicked, and adds an option to sync all monitors
-// @version         1.0.0
+// @version         1.0.1
 // @author          drwb3
 // @include         explorer.exe
 // @compilerOptions -lole32 -luuid -lshell32 -lshlwapi
@@ -55,6 +55,7 @@ with the same folder and settings.
 #include <windowsx.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
+#include <strsafe.h>
 
 #include <algorithm>
 #include <atomic>
@@ -79,7 +80,10 @@ const CLSID kClsidSlideshowContextMenu = {
     0x445c,
     {0xab, 0x3d, 0xd8, 0xfd, 0xa9, 0xba, 0xe7, 0xef}};
 const wchar_t kSyncMenuText[] = L"Sync desktop backgrounds";
+const wchar_t kSyncHelpText[] =
+    L"Copies this monitor's background to every other monitor";
 const wchar_t kNextVerb[] = L"NextDesktopBackground";
+const wchar_t kSyncVerb[] = L"SyncDesktopBackgrounds";
 
 std::atomic<UINT> g_syncOffset{UINT_MAX};
 std::atomic<DWORD> g_menuMessagePos{0};
@@ -448,20 +452,31 @@ std::optional<Action> ClassifyCommand(CMINVOKECOMMANDINFO* info) {
         return offset < syncOffset ? std::optional(next) : std::nullopt;
     }
 
+    std::wstring verb;
     if (info->cbSize >= sizeof(CMINVOKECOMMANDINFOEX) &&
         (info->fMask & CMIC_MASK_UNICODE)) {
         auto* infoEx = (CMINVOKECOMMANDINFOEX*)info;
-        if (infoEx->lpVerbW && !IS_INTRESOURCE(infoEx->lpVerbW) &&
-            _wcsicmp(infoEx->lpVerbW, kNextVerb) == 0) {
-            return next;
+        if (infoEx->lpVerbW && !IS_INTRESOURCE(infoEx->lpVerbW)) {
+            verb = infoEx->lpVerbW;
+        }
+    }
+    if (verb.empty()) {
+        int length =
+            MultiByteToWideChar(CP_ACP, 0, info->lpVerb, -1, nullptr, 0);
+        if (length > 0) {
+            verb.resize(length);
+            MultiByteToWideChar(CP_ACP, 0, info->lpVerb, -1, verb.data(),
+                                length);
+            verb.resize(length - 1);
         }
     }
 
-    char verb[64];
-    WideCharToMultiByte(CP_ACP, 0, kNextVerb, -1, verb, sizeof(verb), nullptr,
-                        nullptr);
-    if (_stricmp(info->lpVerb, verb) == 0) {
+    Wh_Log(L"InvokeCommand verb: %s", verb.c_str());
+    if (_wcsicmp(verb.c_str(), kNextVerb) == 0) {
         return next;
+    }
+    if (_wcsicmp(verb.c_str(), kSyncVerb) == 0) {
+        return Action::Sync;
     }
     return std::nullopt;
 }
@@ -495,6 +510,10 @@ HRESULT STDMETHODCALLTYPE QueryContextMenu_Hook(IContextMenu* self,
     int countBefore = GetMenuItemCount(menu);
     HRESULT hr = QueryContextMenu_Original(self, menu, indexMenu, idCmdFirst,
                                            idCmdLast, flags);
+    Wh_Log(L"QueryContextMenu flags=0x%X ids=%u-%u index=%u hr=0x%08X "
+           L"added=%d",
+           flags, idCmdFirst, idCmdLast, indexMenu, hr,
+           GetMenuItemCount(menu) - countBefore);
     if (FAILED(hr) || !g_settings.syncMenuItem ||
         (flags & CMF_DEFAULTONLY)) {
         return hr;
@@ -513,6 +532,42 @@ HRESULT STDMETHODCALLTYPE QueryContextMenu_Hook(IContextMenu* self,
     }
     g_syncOffset = nextOffset;
     return MAKE_HRESULT(SEVERITY_SUCCESS, 0, nextOffset + 1);
+}
+
+using GetCommandString_t = HRESULT(STDMETHODCALLTYPE*)(IContextMenu*,
+                                                       UINT_PTR,
+                                                       UINT,
+                                                       UINT*,
+                                                       CHAR*,
+                                                       UINT);
+GetCommandString_t GetCommandString_Original;
+
+// The Windows 11 menu identifies items by verb, which the original handler
+// can't supply for the added item.
+HRESULT STDMETHODCALLTYPE GetCommandString_Hook(IContextMenu* self,
+                                                UINT_PTR idCmd,
+                                                UINT type,
+                                                UINT* reserved,
+                                                CHAR* name,
+                                                UINT cchMax) {
+    Wh_Log(L"GetCommandString id=%u type=0x%X", (UINT)idCmd, type);
+    if (idCmd != g_syncOffset) {
+        return GetCommandString_Original(self, idCmd, type, reserved, name,
+                                         cchMax);
+    }
+
+    switch (type) {
+        case GCS_VERBW:
+            return StringCchCopyW((PWSTR)name, cchMax, kSyncVerb);
+        case GCS_VERBA:
+            return StringCchCopyA(name, cchMax, "SyncDesktopBackgrounds");
+        case GCS_HELPTEXTW:
+            return StringCchCopyW((PWSTR)name, cchMax, kSyncHelpText);
+        case GCS_VALIDATEW:
+        case GCS_VALIDATEA:
+            return S_OK;
+    }
+    return E_INVALIDARG;
 }
 
 using InvokeCommand_t = HRESULT(STDMETHODCALLTYPE*)(IContextMenu*,
@@ -538,6 +593,7 @@ HRESULT STDMETHODCALLTYPE InvokeCommand_Hook(IContextMenu* self,
 struct ContextMenuMethods {
     void* queryContextMenu;
     void* invokeCommand;
+    void* getCommandString;
 };
 
 // Runs on its own thread so COM can be initialized as needed.
@@ -558,6 +614,7 @@ DWORD WINAPI FindContextMenuMethods(void* param) {
                                (PCWSTR)vtable[4], &module)) {
             methods->queryContextMenu = vtable[3];
             methods->invokeCommand = vtable[4];
+            methods->getCommandString = vtable[5];
         }
         menu->Release();
     } else {
@@ -589,7 +646,8 @@ BOOL Wh_ModInit() {
     WaitForSingleObject(thread, INFINITE);
     CloseHandle(thread);
 
-    if (!methods.queryContextMenu || !methods.invokeCommand) {
+    if (!methods.queryContextMenu || !methods.invokeCommand ||
+        !methods.getCommandString) {
         Wh_Log(L"Slideshow context menu handler not found");
         return FALSE;
     }
@@ -598,6 +656,8 @@ BOOL Wh_ModInit() {
                        (void**)&QueryContextMenu_Original);
     Wh_SetFunctionHook(methods.invokeCommand, (void*)InvokeCommand_Hook,
                        (void**)&InvokeCommand_Original);
+    Wh_SetFunctionHook(methods.getCommandString, (void*)GetCommandString_Hook,
+                       (void**)&GetCommandString_Original);
     return TRUE;
 }
 
