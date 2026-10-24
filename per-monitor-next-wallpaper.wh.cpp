@@ -3,7 +3,7 @@
 // @name            Per-Monitor Next Desktop Background
 // @description     Makes "Next desktop background" change the monitor you right-clicked, and adds an option to sync all monitors
 // @version         1.0.1
-// @author          drwb3
+// @author          Sp1d3rM0nk3y
 // @include         explorer.exe
 // @compilerOptions -lole32 -luuid -lshell32 -lshlwapi
 // ==/WindhawkMod==
