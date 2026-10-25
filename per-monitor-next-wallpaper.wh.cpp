@@ -29,7 +29,8 @@ right-clicked monitor's image to every other monitor. You can also set
 **Next desktop background** still runs Windows' own slideshow advance. Windows
 picks the monitor that gets the next image in turn
 (`CMultimonWallpaperState::_GetNextMonitor` in `shell32.dll`), and the mod
-makes that pick return the monitor you right-clicked. Windows' shuffle order,
+makes that pick return the monitor you right-clicked. It also stops Windows
+from giving other monitors a new image in the same advance. Windows' shuffle order,
 image history and saved settings work as usual.
 
 Windows can't show the same slideshow image on several monitors, so **Sync
@@ -593,6 +594,11 @@ using GetNextMonitor_t = int(WINAPI*)(void* self,
                                       bool flag);
 GetNextMonitor_t GetNextMonitor_Original;
 
+// Modes 0-2 pick the monitor for a new image; higher modes are lookups.
+constexpr int kMaxPickMonitorMode = 2;
+
+thread_local bool t_redirected = false;
+
 // Picks the monitor that gets the next slideshow image.
 int WINAPI GetNextMonitor_Hook(void* self,
                                int lastIndex,
@@ -600,16 +606,32 @@ int WINAPI GetNextMonitor_Hook(void* self,
                                int mode,
                                PCWSTR imagePath,
                                bool flag) {
-    if (HMONITOR target = TakePendingMonitor()) {
-        int count = GetMonitorCount(self);
-        for (int i = 0; i < count; i++) {
-            if (GetMonitorAt(self, i) == target) {
-                return i;
+    if (mode <= kMaxPickMonitorMode) {
+        t_redirected = false;
+        if (HMONITOR target = TakePendingMonitor()) {
+            int count = GetMonitorCount(self);
+            for (int i = 0; i < count; i++) {
+                if (GetMonitorAt(self, i) == target) {
+                    t_redirected = true;
+                    return i;
+                }
             }
         }
     }
     return GetNextMonitor_Original(self, lastIndex, orientation, mode,
                                    imagePath, flag);
+}
+
+using DoesAnyMonitorNeedAnImage_t = bool(WINAPI*)(const void* self);
+DoesAnyMonitorNeedAnImage_t DoesAnyMonitorNeedAnImage_Original;
+
+// Stops the advance after the clicked monitor got its image.
+bool WINAPI DoesAnyMonitorNeedAnImage_Hook(const void* self) {
+    if (t_redirected) {
+        t_redirected = false;
+        return false;
+    }
+    return DoesAnyMonitorNeedAnImage_Original(self);
 }
 
 bool IsSlideshowMenu(IContextMenu* self) {
@@ -821,6 +843,11 @@ bool HookShell32() {
             {LR"(public: int __cdecl CMultimonWallpaperState::_GetNextMonitor(int,enum IMAGE_ORIENTATION,enum CMultimonWallpaperState::GET_NEXT_MONITOR_MODE,unsigned short const *,bool))"},
             &GetNextMonitor_Original,
             GetNextMonitor_Hook,
+        },
+        {
+            {LR"(public: bool __cdecl CMultimonWallpaperState::DoesAnyMonitorNeedAnImage(void)const )"},
+            &DoesAnyMonitorNeedAnImage_Original,
+            DoesAnyMonitorNeedAnImage_Hook,
         },
         {
             {LR"(public: int __cdecl CMultimonWallpaperState::GetCount(void)const )"},
